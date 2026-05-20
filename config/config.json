@@ -4,20 +4,21 @@
       "users": "data/bgg-26m-reviews.csv"
     },
     "encoders": {
-      "user_id": "model/encoders/user_id_encoder.json",
+      "user_id":   "model/encoders/user_id_encoder.json",
       "game_name": "model/encoders/game_name_encoder.json",
-      "category": "model/encoders/category_encoder.json",
-      "mechanic": "model/encoders/mechanic_encoder.json"
+      "category":  "model/encoders/category_encoder.json",
+      "mechanic":  "model/encoders/mechanic_encoder.json"
     },
     "models": {
       "recommender": "model/board_game_recommender{}.pt",
-      "history": "model/history.json"
+      "history":     "model/history.json",
+      "scalers":     "model/scalers.joblib"
     },
     "data_model": {
-      "game_data_model": "data/prep_data/game_data_model.csv",
-      "user_data_model": "data/prep_data/user_data_model.csv",
-      "train_data_path": "data/prep_data/train_data.csv",
-      "validation_data_path": "data/prep_data/validation_data.csv",
-      "test_data_path": "data/prep_data/test_data.csv"
+      "game_data_model":     "data/prep_data/game_data_model.csv",
+      "user_data_model":     "data/prep_data/user_data_model.csv",
+      "train_data_path":     "data/prep_data/train_data.csv",
+      "validation_data_path":"data/prep_data/validation_data.csv",
+      "test_data_path":      "data/prep_data/test_data.csv"
     }
   }
