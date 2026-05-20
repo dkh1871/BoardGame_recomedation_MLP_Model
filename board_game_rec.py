@@ -368,8 +368,17 @@ def get_game_data(config: dict) -> pd.DataFrame:
     scalers_path         = config["models"]["scalers"]
 
     print("Process game data")
+    cache_is_valid = False
     if os.path.exists(game_data_model_path):
         game_data = pd.read_csv(game_data_model_path)
+        # Guard: if game_id_encoded is entirely NaN the cache is stale
+        # (written before the str-key encoder fix). Wipe it and start fresh.
+        if "game_id_encoded" not in game_data.columns or game_data["game_id_encoded"].isna().all():
+            print("WARNING: cached game_data_model.csv has invalid game_id_encoded — regenerating.")
+            os.remove(game_data_model_path)
+            game_data = process_game_data(game_data_file)
+        else:
+            cache_is_valid = True
     else:
         game_data = process_game_data(game_data_file)
 
@@ -379,7 +388,7 @@ def get_game_data(config: dict) -> pd.DataFrame:
     mechanic_encoder = create_encoder(mechanic_encoder_path, game_data['mechanic'], "mechanic")
 
     print("Prep game data for training")
-    if not os.path.exists(game_data_model_path):
+    if not cache_is_valid:
         game_data, scalers = prep_game_data(
             game_data, game_encoder, category_encoder, mechanic_encoder
         )
@@ -471,9 +480,13 @@ def create_train_data(
     game_data_model.dropna(inplace=True)
     print(game_data_model.shape)
 
-    # List columns are stored as strings in CSV; convert back to Python lists.
-    game_data_model['category_indices'] = game_data_model['category_indices'].apply(ast.literal_eval)
-    game_data_model['mechanic_indices'] = game_data_model['mechanic_indices'].apply(ast.literal_eval)
+    # List columns are strings when loaded from CSV but already lists when passed
+    # directly from prep_game_data; handle both cases.
+    def ensure_list(val):
+        return val if isinstance(val, list) else ast.literal_eval(val)
+
+    game_data_model['category_indices'] = game_data_model['category_indices'].apply(ensure_list)
+    game_data_model['mechanic_indices'] = game_data_model['mechanic_indices'].apply(ensure_list)
 
     print("Split into train, validation, and test sets")
     train_data, test_data       = model_selection.train_test_split(game_data_model, test_size=0.2,  random_state=42)
