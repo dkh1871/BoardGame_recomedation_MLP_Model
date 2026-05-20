@@ -1,6 +1,5 @@
 ########################################################################################
 # Board Game Recommender
-# Created for: DSC680 Bellview University
 # Created by David Hatchett
 # Created on: 2026-02-14
 #
@@ -254,8 +253,10 @@ def get_vocab(series: pd.Series) -> dict:
 def encode_text(series: pd.Series) -> dict:
     '''
     Encodes a text Series into a dictionary mapping each unique value to an integer.
+    Keys are always stored as strings so they survive a JSON round-trip without
+    type changes (json.dump silently converts integer keys to strings).
     '''
-    return {item: i for i, item in enumerate(set(series))}
+    return {str(item): i for i, item in enumerate(set(series))}
 
 
 def create_encoder(file_name: str, data: pd.Series = None, field: str = None) -> dict:
@@ -332,7 +333,9 @@ def prep_game_data(
     inference time.
     '''
     game_data = game_data.copy()
-    game_data["game_id_encoded"] = game_data["game_id"].map(game_encoder)
+    # game_encoder keys are strings (JSON round-trip converts int keys to str),
+    # so cast game_id to str before mapping to avoid silent NaN from type mismatch.
+    game_data["game_id_encoded"] = game_data["game_id"].astype(str).map(game_encoder)
 
     game_data["category_indices"] = game_data["category"].apply(
         lambda x: [category_encoder[item] for item in x]
@@ -418,7 +421,6 @@ def get_user_data(config: dict) -> pd.DataFrame:
     user_data_model_path= config["data_model"]["user_data_model"]
     user_encoder_path   = config["encoders"]["user_id"]
 
-    print("Get User Data")
     if not os.path.exists(user_data_model_path):
         user_data = process_user_data(user_data_file)
     else:
