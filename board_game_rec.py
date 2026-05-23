@@ -21,6 +21,7 @@
 # was written by me.
 ########################################################################################
 
+import contextlib
 import torch
 import pandas as pd
 import sys
@@ -247,7 +248,7 @@ def get_vocab(series: pd.Series) -> dict:
     for record in series:
         for token in record:
             out_set.add(token.strip())
-    return {token: i for i, token in enumerate(out_set)}
+    return {token: i for i, token in enumerate(sorted(out_set))}
 
 
 def encode_text(series: pd.Series) -> dict:
@@ -256,7 +257,7 @@ def encode_text(series: pd.Series) -> dict:
     Keys are always stored as strings so they survive a JSON round-trip without
     type changes (json.dump silently converts integer keys to strings).
     '''
-    return {str(item): i for i, item in enumerate(set(series))}
+    return {str(item): i for i, item in enumerate(sorted(set(series)))}
 
 
 def create_encoder(file_name: str, data: pd.Series = None, field: str = None) -> dict:
@@ -264,6 +265,8 @@ def create_encoder(file_name: str, data: pd.Series = None, field: str = None) ->
     Creates or loads an encoder for a given field.
     If the encoder file already exists it will be loaded; otherwise it will be
     created from `data` and saved to `file_name`.
+
+    added an else statement and raise for if no data and no field vars where passed.
     '''
     if os.path.exists(file_name):
         with open(file_name, "r", encoding="utf-8") as f:
@@ -277,6 +280,8 @@ def create_encoder(file_name: str, data: pd.Series = None, field: str = None) ->
         with open(file_name, "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=True)
         return vocab
+    else:
+        raise ValueError("data and field are required to create a new encoder") 
 
 
 def process_game_data(file_name: str) -> pd.DataFrame:
@@ -537,14 +542,12 @@ def get_encoders(config: dict) -> tuple[dict, dict, dict, dict]:
     return user_encoder, game_encoder, category_encoder, mechanic_encoder
 
 
-def log_progress(epoch, epochs, step_count, loss_list, precision_list, recall_list, data_size):
+def log_progress(epoch, epochs, step_count, avg_loss, avg_precision, avg_recall, data_size):
     '''
     Writes a single-line progress update to stderr using a carriage return so it
     overwrites the previous line in the terminal.
+    Accepts pre-computed running averages so this function is always O(1).
     '''
-    avg_loss      = sum(loss_list)      / len(loss_list)
-    avg_precision = sum(precision_list) / len(precision_list)
-    avg_recall    = sum(recall_list)    / len(recall_list)
     sys.stderr.write(
         f"\r{epoch+1:02d}/{epochs:02d} | Step: {step_count}/{data_size}"
         f" | Avg Loss: {avg_loss:<6.9f}"
@@ -552,6 +555,89 @@ def log_progress(epoch, epochs, step_count, loss_list, precision_list, recall_li
         f" | Avg Recall: {avg_recall:<6.9f}"
     )
     sys.stderr.flush()
+
+
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    threshold: float,
+    epoch: int,
+    epochs: int,
+    log_progress_step: int,
+    optimizer: torch.optim.Optimizer = None,
+) -> tuple[float, float, float]:
+    '''
+    Runs one full pass over `loader` and returns epoch-average metrics.
+
+    If `optimizer` is provided the model is set to train mode and weights are
+    updated after each batch.  If `optimizer` is None the model runs in eval
+    mode under torch.no_grad() — suitable for validation and test passes.
+
+    Maintains O(1) running sums so neither logging nor the final averages
+    require iterating over accumulated lists.
+
+    Returns:
+        (avg_loss, avg_precision, avg_recall) — epoch averages as floats.
+    '''
+    is_training = optimizer is not None
+    model.train() if is_training else model.eval()
+
+    total_loss      = 0.0
+    total_precision = 0.0
+    total_recall    = 0.0
+    step_count      = 0
+    data_size       = len(loader)
+
+    # nullcontext() lets us write the loop once regardless of train vs eval.
+    grad_ctx = contextlib.nullcontext() if is_training else torch.no_grad()
+    with grad_ctx:
+        for batch in loader:
+            if is_training:
+                optimizer.zero_grad()
+
+            x = model(
+                user_id          = batch["users_id"],
+                game_id          = batch["game_id"],
+                avg_usr_rating   = batch["avg_usr_rating"],
+                avg_usr_weight   = batch["avg_usr_weight"],
+                bayes_average    = batch["bayes_average"],
+                age              = batch["age"],
+                game_owners      = batch["game_owners"],
+                category_indices = batch["category_indices"],
+                category_offsets = batch["category_offsets"],
+                mechanic_indices = batch["mechanic_indices"],
+                mechanic_offsets = batch["mechanic_offsets"],
+            ).squeeze()
+
+            loss = criterion(x, batch["user_rating"].to(torch.float32))
+            total_loss += loss.item()
+
+            if is_training:
+                loss.backward()
+                optimizer.step()
+
+            y_true = batch["user_rating"].detach().cpu().numpy()
+            y_pred = x.detach().cpu().numpy()
+
+            y_true_binary = (y_true >= threshold).astype(np.int64)
+            y_pred_binary = (y_pred >= threshold).astype(np.int64)
+
+            total_precision += precision_score(y_true_binary, y_pred_binary, zero_division=0)
+            total_recall    += recall_score(   y_true_binary, y_pred_binary, zero_division=0)
+
+            # Log every log_progress_step batches using the running average
+            # up to this point.  step_count+1 is the number of batches seen.
+            if step_count % log_progress_step == 0:
+                n = step_count + 1
+                log_progress(
+                    epoch, epochs, step_count,
+                    total_loss / n, total_precision / n, total_recall / n,
+                    data_size,
+                )
+            step_count += 1
+
+    return total_loss / data_size, total_precision / data_size, total_recall / data_size
 
 
 def train_model(
@@ -583,97 +669,23 @@ def train_model(
 
     print(f"Training model for {epochs} epochs")
     for epoch in range(epochs):
-        model.train()
-        train_loss         = []
-        train_precision    = []
-        train_recall       = []
-        validation_loss    = []
-        validation_precision = []
-        validation_recall  = []
-        step_count = 0
-        data_size  = len(train_loader)
+        avg_train_loss, avg_train_precision, avg_train_recall = _run_epoch(
+            model, train_loader, criterion, threshold,
+            epoch, epochs, log_progress_step, optimizer,
+        )
+        avg_val_loss, avg_val_precision, avg_val_recall = _run_epoch(
+            model, validation_loader, criterion, threshold,
+            epoch, epochs, log_progress_step,
+        )
 
-        for batch in train_loader:
-            optimizer.zero_grad()  # zero gradients before each forward pass
-
-            x = model(
-                user_id          = batch["users_id"],
-                game_id          = batch["game_id"],
-                avg_usr_rating   = batch["avg_usr_rating"],
-                avg_usr_weight   = batch["avg_usr_weight"],
-                bayes_average    = batch["bayes_average"],
-                age              = batch["age"],
-                game_owners      = batch["game_owners"],
-                category_indices = batch["category_indices"],
-                category_offsets = batch["category_offsets"],
-                mechanic_indices = batch["mechanic_indices"],
-                mechanic_offsets = batch["mechanic_offsets"],
-            ).squeeze()
-
-            loss = criterion(x, batch["user_rating"].to(torch.float32))
-            train_loss.append(loss.item())
-            loss.backward()
-            optimizer.step()
-
-            y_true = batch["user_rating"].detach().cpu().numpy()
-            y_pred = x.detach().cpu().numpy()
-
-            y_true_binary = (y_true >= threshold).astype(np.int64)
-            y_pred_binary = (y_pred >= threshold).astype(np.int64)
-
-            train_precision.append(precision_score(y_true_binary, y_pred_binary, zero_division=0))
-            train_recall.append(   recall_score(   y_true_binary, y_pred_binary, zero_division=0))
-
-            if step_count % log_progress_step == 0:
-                log_progress(epoch, epochs, step_count, train_loss, train_precision, train_recall, data_size)
-            step_count += 1
-
-        # ── Validation loop ──────────────────────────────────────────────────
-        data_size  = len(validation_loader)
-        step_count = 0
-        model.eval()
-        with torch.no_grad():
-            for batch in validation_loader:
-                x = model(
-                    user_id          = batch["users_id"],
-                    game_id          = batch["game_id"],
-                    avg_usr_rating   = batch["avg_usr_rating"],
-                    avg_usr_weight   = batch["avg_usr_weight"],
-                    bayes_average    = batch["bayes_average"],
-                    age              = batch["age"],
-                    game_owners      = batch["game_owners"],
-                    category_indices = batch["category_indices"],
-                    category_offsets = batch["category_offsets"],
-                    mechanic_indices = batch["mechanic_indices"],
-                    mechanic_offsets = batch["mechanic_offsets"],
-                ).squeeze()
-
-                loss = criterion(x, batch["user_rating"].to(torch.float32))
-                validation_loss.append(loss.item())
-
-                y_true = batch["user_rating"].detach().cpu().numpy()
-                y_pred = x.detach().cpu().numpy()
-
-                y_true_binary = (y_true >= threshold).astype(np.int64)
-                y_pred_binary = (y_pred >= threshold).astype(np.int64)
-
-                validation_precision.append(precision_score(y_true_binary, y_pred_binary, zero_division=0))
-                validation_recall.append(   recall_score(   y_true_binary, y_pred_binary, zero_division=0))
-
-                if step_count % log_progress_step == 0:
-                    log_progress(epoch, epochs, step_count, validation_loss, validation_precision, validation_recall, data_size)
-                step_count += 1
-
-        avg_train_loss = sum(train_loss)      / len(train_loss)
-        avg_val_loss   = sum(validation_loss) / len(validation_loss)
         print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}")
 
         history["train_loss"].append(avg_train_loss)
         history["validation_loss"].append(avg_val_loss)
-        history["train_precision"].append(    sum(train_precision)      / len(train_precision))
-        history["train_recall"].append(       sum(train_recall)         / len(train_recall))
-        history["validation_precision"].append(sum(validation_precision)/ len(validation_precision))
-        history["validation_recall"].append(  sum(validation_recall)    / len(validation_recall))
+        history["train_precision"].append(avg_train_precision)
+        history["train_recall"].append(avg_train_recall)
+        history["validation_precision"].append(avg_val_precision)
+        history["validation_recall"].append(avg_val_recall)
 
         torch.save(model.state_dict(), config["models"]["recommender"].format(epoch + 1))
 
