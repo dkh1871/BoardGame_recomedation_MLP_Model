@@ -32,12 +32,13 @@ import json
 import os
 import joblib
 
+import torchmetrics.functional as tmf
+
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch import nn
 from sklearn import model_selection
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import precision_score, recall_score
 
 # Detect device once at module level so it is not recomputed throughout the code.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -542,7 +543,7 @@ def get_encoders(config: dict) -> tuple[dict, dict, dict, dict]:
     return user_encoder, game_encoder, category_encoder, mechanic_encoder
 
 
-def log_progress(epoch, epochs, step_count, avg_loss, avg_precision, avg_recall, data_size):
+def log_progress(epoch, epochs, step_count, avg_loss, avg_nrmse, avg_mae, avg_r2, data_size):
     '''
     Writes a single-line progress update to stderr using a carriage return so it
     overwrites the previous line in the terminal.
@@ -550,9 +551,10 @@ def log_progress(epoch, epochs, step_count, avg_loss, avg_precision, avg_recall,
     '''
     sys.stderr.write(
         f"\r{epoch+1:02d}/{epochs:02d} | Step: {step_count}/{data_size}"
-        f" | Avg Loss: {avg_loss:<6.9f}"
-        f" | Avg Precision: {avg_precision:<6.9f}"
-        f" | Avg Recall: {avg_recall:<6.9f}"
+        f" | Loss: {avg_loss:<10.6f}"
+        f" | NRMSE: {avg_nrmse:<8.6f}"
+        f" | MAE: {avg_mae:<8.6f}"
+        f" | R²: {avg_r2:<8.6f}"
     )
     sys.stderr.flush()
 
@@ -561,12 +563,11 @@ def _run_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
-    threshold: float,
     epoch: int,
     epochs: int,
     log_progress_step: int,
     optimizer: torch.optim.Optimizer = None,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, float]:
     '''
     Runs one full pass over `loader` and returns epoch-average metrics.
 
@@ -578,16 +579,17 @@ def _run_epoch(
     require iterating over accumulated lists.
 
     Returns:
-        (avg_loss, avg_precision, avg_recall) — epoch averages as floats.
+        (avg_loss, avg_nrmse, avg_mae, avg_r2) — epoch averages as floats.
     '''
     is_training = optimizer is not None
     model.train() if is_training else model.eval()
 
-    total_loss      = 0.0
-    total_precision = 0.0
-    total_recall    = 0.0
-    step_count      = 0
-    data_size       = len(loader)
+    total_loss  = 0.0
+    total_nrmse = 0.0
+    total_mae   = 0.0
+    total_r2    = 0.0
+    step_count  = 0
+    data_size   = len(loader)
 
     # nullcontext() lets us write the loop once regardless of train vs eval.
     grad_ctx = contextlib.nullcontext() if is_training else torch.no_grad()
@@ -610,21 +612,17 @@ def _run_epoch(
                 mechanic_offsets = batch["mechanic_offsets"],
             ).squeeze()
 
-            loss = criterion(x, batch["user_rating"].to(torch.float32))
+            out_true = batch["user_rating"].to(torch.float32)
+            loss = criterion(x, out_true)
             total_loss += loss.item()
 
             if is_training:
                 loss.backward()
                 optimizer.step()
 
-            y_true = batch["user_rating"].detach().cpu().numpy()
-            y_pred = x.detach().cpu().numpy()
-
-            y_true_binary = (y_true >= threshold).astype(np.int64)
-            y_pred_binary = (y_pred >= threshold).astype(np.int64)
-
-            total_precision += precision_score(y_true_binary, y_pred_binary, zero_division=0)
-            total_recall    += recall_score(   y_true_binary, y_pred_binary, zero_division=0)
+            total_nrmse += tmf.normalized_root_mean_squared_error(x, out_true, normalization='range').item()
+            total_mae   += tmf.mean_absolute_error(x, out_true).item()
+            total_r2    += tmf.r2_score(x, out_true).item()
 
             # Log every log_progress_step batches using the running average
             # up to this point.  step_count+1 is the number of batches seen.
@@ -632,12 +630,12 @@ def _run_epoch(
                 n = step_count + 1
                 log_progress(
                     epoch, epochs, step_count,
-                    total_loss / n, total_precision / n, total_recall / n,
+                    total_loss / n, total_nrmse / n, total_mae / n, total_r2 / n,
                     data_size,
                 )
             step_count += 1
 
-    return total_loss / data_size, total_precision / data_size, total_recall / data_size
+    return total_loss / data_size, total_nrmse / data_size, total_mae / data_size, total_r2 / data_size
 
 
 def train_model(
@@ -648,44 +646,69 @@ def train_model(
     epochs: int = 10,
     learning_rate: float = 0.001,
     weight_decay: float = 0.0001,
-    threshold: float = 7.0,
 ) -> tuple[nn.Module, dict]:
     '''
     Trains the model and saves a checkpoint after each epoch.
     Returns the trained model and a history dictionary of per-epoch metrics.
+    Tracks NRMSE, MAE, and R² to match the evaluation metrics used in the
+    results notebook.
+
+    Uses ReduceLROnPlateau to halve the learning rate when validation loss
+    has not improved for `lr_patience` consecutive epochs, helping the model
+    escape the early plateau seen in longer training runs.
     '''
-    optimizer         = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer  = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode      = 'min',   # reduce when monitored metric stops decreasing
+        factor    = 0.5,     # halve the LR on each trigger
+        patience  = 2,       # wait 2 epochs of no improvement before reducing
+        min_lr    = 1e-6,    # floor so LR never reaches zero
+    )
     criterion         = nn.MSELoss()
     log_progress_step = 50
 
     history = {
-        "train_loss":          [],
-        "validation_loss":     [],
-        "train_precision":     [],
-        "train_recall":        [],
-        "validation_precision":[],
-        "validation_recall":   [],
+        "train_loss":      [],
+        "validation_loss": [],
+        "train_nrmse":     [],
+        "train_mae":       [],
+        "train_r2":        [],
+        "validation_nrmse":[],
+        "validation_mae":  [],
+        "validation_r2":   [],
+        "learning_rate":   [],
     }
 
     print(f"Training model for {epochs} epochs")
     for epoch in range(epochs):
-        avg_train_loss, avg_train_precision, avg_train_recall = _run_epoch(
-            model, train_loader, criterion, threshold,
+        avg_train_loss, avg_train_nrmse, avg_train_mae, avg_train_r2 = _run_epoch(
+            model, train_loader, criterion,
             epoch, epochs, log_progress_step, optimizer,
         )
-        avg_val_loss, avg_val_precision, avg_val_recall = _run_epoch(
-            model, validation_loader, criterion, threshold,
+        avg_val_loss, avg_val_nrmse, avg_val_mae, avg_val_r2 = _run_epoch(
+            model, validation_loader, criterion,
             epoch, epochs, log_progress_step,
         )
 
-        print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}")
+        # Step the scheduler on validation loss; must come before reading the LR
+        # so the history records the LR that will be used next epoch.
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}"
+              f"  Val NRMSE: {avg_val_nrmse:.4f}  Val MAE: {avg_val_mae:.4f}"
+              f"  Val R²: {avg_val_r2:.4f}  LR: {current_lr:.2e}")
 
         history["train_loss"].append(avg_train_loss)
         history["validation_loss"].append(avg_val_loss)
-        history["train_precision"].append(avg_train_precision)
-        history["train_recall"].append(avg_train_recall)
-        history["validation_precision"].append(avg_val_precision)
-        history["validation_recall"].append(avg_val_recall)
+        history["train_nrmse"].append(avg_train_nrmse)
+        history["train_mae"].append(avg_train_mae)
+        history["train_r2"].append(avg_train_r2)
+        history["validation_nrmse"].append(avg_val_nrmse)
+        history["validation_mae"].append(avg_val_mae)
+        history["validation_r2"].append(avg_val_r2)
+        history["learning_rate"].append(current_lr)
 
         torch.save(model.state_dict(), config["models"]["recommender"].format(epoch + 1))
 
@@ -758,7 +781,6 @@ def main():
         epochs            = 10,
         learning_rate     = 0.001,
         weight_decay      = 0.0001,
-        threshold         = 7.0,
     )
 
     print("Save history")
