@@ -21,6 +21,7 @@
 # was written by me.
 ########################################################################################
 
+import contextlib
 import torch
 import pandas as pd
 import sys
@@ -31,12 +32,13 @@ import json
 import os
 import joblib
 
+import torchmetrics.functional as tmf
+
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch import nn
 from sklearn import model_selection
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import precision_score, recall_score
 
 # Detect device once at module level so it is not recomputed throughout the code.
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -247,7 +249,7 @@ def get_vocab(series: pd.Series) -> dict:
     for record in series:
         for token in record:
             out_set.add(token.strip())
-    return {token: i for i, token in enumerate(out_set)}
+    return {token: i for i, token in enumerate(sorted(out_set))}
 
 
 def encode_text(series: pd.Series) -> dict:
@@ -256,7 +258,7 @@ def encode_text(series: pd.Series) -> dict:
     Keys are always stored as strings so they survive a JSON round-trip without
     type changes (json.dump silently converts integer keys to strings).
     '''
-    return {str(item): i for i, item in enumerate(set(series))}
+    return {str(item): i for i, item in enumerate(sorted(set(series)))}
 
 
 def create_encoder(file_name: str, data: pd.Series = None, field: str = None) -> dict:
@@ -264,6 +266,8 @@ def create_encoder(file_name: str, data: pd.Series = None, field: str = None) ->
     Creates or loads an encoder for a given field.
     If the encoder file already exists it will be loaded; otherwise it will be
     created from `data` and saved to `file_name`.
+
+    added an else statement and raise for if no data and no field vars where passed.
     '''
     if os.path.exists(file_name):
         with open(file_name, "r", encoding="utf-8") as f:
@@ -277,6 +281,8 @@ def create_encoder(file_name: str, data: pd.Series = None, field: str = None) ->
         with open(file_name, "w", encoding="utf-8") as f:
             json.dump(vocab, f, ensure_ascii=True)
         return vocab
+    else:
+        raise ValueError("data and field are required to create a new encoder") 
 
 
 def process_game_data(file_name: str) -> pd.DataFrame:
@@ -537,64 +543,60 @@ def get_encoders(config: dict) -> tuple[dict, dict, dict, dict]:
     return user_encoder, game_encoder, category_encoder, mechanic_encoder
 
 
-def log_progress(epoch, epochs, step_count, loss_list, precision_list, recall_list, data_size):
+def log_progress(epoch, epochs, step_count, avg_loss, avg_nrmse, avg_mae, avg_r2, data_size):
     '''
     Writes a single-line progress update to stderr using a carriage return so it
     overwrites the previous line in the terminal.
+    Accepts pre-computed running averages so this function is always O(1).
     '''
-    avg_loss      = sum(loss_list)      / len(loss_list)
-    avg_precision = sum(precision_list) / len(precision_list)
-    avg_recall    = sum(recall_list)    / len(recall_list)
     sys.stderr.write(
         f"\r{epoch+1:02d}/{epochs:02d} | Step: {step_count}/{data_size}"
-        f" | Avg Loss: {avg_loss:<6.9f}"
-        f" | Avg Precision: {avg_precision:<6.9f}"
-        f" | Avg Recall: {avg_recall:<6.9f}"
+        f" | Loss: {avg_loss:<10.6f}"
+        f" | NRMSE: {avg_nrmse:<8.6f}"
+        f" | MAE: {avg_mae:<8.6f}"
+        f" | R²: {avg_r2:<8.6f}"
     )
     sys.stderr.flush()
 
 
-def train_model(
+def _run_epoch(
     model: nn.Module,
-    train_loader: DataLoader,
-    validation_loader: DataLoader,
-    config: dict,
-    epochs: int = 10,
-    learning_rate: float = 0.001,
-    weight_decay: float = 0.0001,
-    threshold: float = 7.0,
-) -> tuple[nn.Module, dict]:
+    loader: DataLoader,
+    criterion: nn.Module,
+    epoch: int,
+    epochs: int,
+    log_progress_step: int,
+    optimizer: torch.optim.Optimizer = None,
+) -> tuple[float, float, float, float]:
     '''
-    Trains the model and saves a checkpoint after each epoch.
-    Returns the trained model and a history dictionary of per-epoch metrics.
+    Runs one full pass over `loader` and returns epoch-average metrics.
+
+    If `optimizer` is provided the model is set to train mode and weights are
+    updated after each batch.  If `optimizer` is None the model runs in eval
+    mode under torch.no_grad() — suitable for validation and test passes.
+
+    Maintains O(1) running sums so neither logging nor the final averages
+    require iterating over accumulated lists.
+
+    Returns:
+        (avg_loss, avg_nrmse, avg_mae, avg_r2) — epoch averages as floats.
     '''
-    optimizer         = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    criterion         = nn.MSELoss()
-    log_progress_step = 50
+    is_training = optimizer is not None
+    model.train() if is_training else model.eval()
 
-    history = {
-        "train_loss":          [],
-        "validation_loss":     [],
-        "train_precision":     [],
-        "train_recall":        [],
-        "validation_precision":[],
-        "validation_recall":   [],
-    }
+    total_loss  = 0.0
+    total_nrmse = 0.0
+    total_mae   = 0.0
+    total_r2    = 0.0
+    step_count  = 0
+    data_size   = len(loader)
 
-    print(f"Training model for {epochs} epochs")
-    for epoch in range(epochs):
-        model.train()
-        train_loss         = []
-        train_precision    = []
-        train_recall       = []
-        validation_loss    = []
-        validation_precision = []
-        validation_recall  = []
-        step_count = 0
-        data_size  = len(train_loader)
-
-        for batch in train_loader:
-            optimizer.zero_grad()  # zero gradients before each forward pass
+    # nullcontext() lets us write the loop once regardless of train vs eval.
+    grad_ctx = contextlib.nullcontext() if is_training else torch.no_grad()
+    with grad_ctx:
+        for batch in loader:
+            if is_training:
+                optimizer.zero_grad()
 
             x = model(
                 user_id          = batch["users_id"],
@@ -610,70 +612,103 @@ def train_model(
                 mechanic_offsets = batch["mechanic_offsets"],
             ).squeeze()
 
-            loss = criterion(x, batch["user_rating"].to(torch.float32))
-            train_loss.append(loss.item())
-            loss.backward()
-            optimizer.step()
+            out_true = batch["user_rating"].to(torch.float32)
+            loss = criterion(x, out_true)
+            total_loss += loss.item()
 
-            y_true = batch["user_rating"].detach().cpu().numpy()
-            y_pred = x.detach().cpu().numpy()
+            if is_training:
+                loss.backward()
+                optimizer.step()
 
-            y_true_binary = (y_true >= threshold).astype(np.int64)
-            y_pred_binary = (y_pred >= threshold).astype(np.int64)
+            total_nrmse += tmf.normalized_root_mean_squared_error(x, out_true, normalization='range').item()
+            total_mae   += tmf.mean_absolute_error(x, out_true).item()
+            total_r2    += tmf.r2_score(x, out_true).item()
 
-            train_precision.append(precision_score(y_true_binary, y_pred_binary, zero_division=0))
-            train_recall.append(   recall_score(   y_true_binary, y_pred_binary, zero_division=0))
-
+            # Log every log_progress_step batches using the running average
+            # up to this point.  step_count+1 is the number of batches seen.
             if step_count % log_progress_step == 0:
-                log_progress(epoch, epochs, step_count, train_loss, train_precision, train_recall, data_size)
+                n = step_count + 1
+                log_progress(
+                    epoch, epochs, step_count,
+                    total_loss / n, total_nrmse / n, total_mae / n, total_r2 / n,
+                    data_size,
+                )
             step_count += 1
 
-        # ── Validation loop ──────────────────────────────────────────────────
-        data_size  = len(validation_loader)
-        step_count = 0
-        model.eval()
-        with torch.no_grad():
-            for batch in validation_loader:
-                x = model(
-                    user_id          = batch["users_id"],
-                    game_id          = batch["game_id"],
-                    avg_usr_rating   = batch["avg_usr_rating"],
-                    avg_usr_weight   = batch["avg_usr_weight"],
-                    bayes_average    = batch["bayes_average"],
-                    age              = batch["age"],
-                    game_owners      = batch["game_owners"],
-                    category_indices = batch["category_indices"],
-                    category_offsets = batch["category_offsets"],
-                    mechanic_indices = batch["mechanic_indices"],
-                    mechanic_offsets = batch["mechanic_offsets"],
-                ).squeeze()
+    return total_loss / data_size, total_nrmse / data_size, total_mae / data_size, total_r2 / data_size
 
-                loss = criterion(x, batch["user_rating"].to(torch.float32))
-                validation_loss.append(loss.item())
 
-                y_true = batch["user_rating"].detach().cpu().numpy()
-                y_pred = x.detach().cpu().numpy()
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    validation_loader: DataLoader,
+    config: dict,
+    epochs: int = 10,
+    learning_rate: float = 0.001,
+    weight_decay: float = 0.0001,
+) -> tuple[nn.Module, dict]:
+    '''
+    Trains the model and saves a checkpoint after each epoch.
+    Returns the trained model and a history dictionary of per-epoch metrics.
+    Tracks NRMSE, MAE, and R² to match the evaluation metrics used in the
+    results notebook.
 
-                y_true_binary = (y_true >= threshold).astype(np.int64)
-                y_pred_binary = (y_pred >= threshold).astype(np.int64)
+    Uses ReduceLROnPlateau to halve the learning rate when validation loss
+    has not improved for `lr_patience` consecutive epochs, helping the model
+    escape the early plateau seen in longer training runs.
+    '''
+    optimizer  = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode      = 'min',   # reduce when monitored metric stops decreasing
+        factor    = 0.5,     # halve the LR on each trigger
+        patience  = 2,       # wait 2 epochs of no improvement before reducing
+        min_lr    = 1e-6,    # floor so LR never reaches zero
+    )
+    criterion         = nn.MSELoss()
+    log_progress_step = 50
 
-                validation_precision.append(precision_score(y_true_binary, y_pred_binary, zero_division=0))
-                validation_recall.append(   recall_score(   y_true_binary, y_pred_binary, zero_division=0))
+    history = {
+        "train_loss":      [],
+        "validation_loss": [],
+        "train_nrmse":     [],
+        "train_mae":       [],
+        "train_r2":        [],
+        "validation_nrmse":[],
+        "validation_mae":  [],
+        "validation_r2":   [],
+        "learning_rate":   [],
+    }
 
-                if step_count % log_progress_step == 0:
-                    log_progress(epoch, epochs, step_count, validation_loss, validation_precision, validation_recall, data_size)
-                step_count += 1
+    print(f"Training model for {epochs} epochs")
+    for epoch in range(epochs):
+        avg_train_loss, avg_train_nrmse, avg_train_mae, avg_train_r2 = _run_epoch(
+            model, train_loader, criterion,
+            epoch, epochs, log_progress_step, optimizer,
+        )
+        avg_val_loss, avg_val_nrmse, avg_val_mae, avg_val_r2 = _run_epoch(
+            model, validation_loader, criterion,
+            epoch, epochs, log_progress_step,
+        )
 
-        avg_train_loss = sum(train_loss)      / len(train_loss)
-        avg_val_loss   = sum(validation_loss) / len(validation_loss)
-        print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}")
+        # Step the scheduler on validation loss; must come before reading the LR
+        # so the history records the LR that will be used next epoch.
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}"
+              f"  Val NRMSE: {avg_val_nrmse:.4f}  Val MAE: {avg_val_mae:.4f}"
+              f"  Val R²: {avg_val_r2:.4f}  LR: {current_lr:.2e}")
 
         history["train_loss"].append(avg_train_loss)
         history["validation_loss"].append(avg_val_loss)
-        history["train_precision"].append(    sum(train_precision)      / len(train_precision))
-        history["train_recall"].append(       sum(train_recall)         / len(train_recall))
-        history["validation_precision"].append(sum(validation_precision)/ len(validation_precision))
-        history["validation_recall"].append(  sum(validation_recall)    / len(validation_recall))
+        history["train_nrmse"].append(avg_train_nrmse)
+        history["train_mae"].append(avg_train_mae)
+        history["train_r2"].append(avg_train_r2)
+        history["validation_nrmse"].append(avg_val_nrmse)
+        history["validation_mae"].append(avg_val_mae)
+        history["validation_r2"].append(avg_val_r2)
+        history["learning_rate"].append(current_lr)
 
         torch.save(model.state_dict(), config["models"]["recommender"].format(epoch + 1))
 
@@ -746,7 +781,6 @@ def main():
         epochs            = 10,
         learning_rate     = 0.001,
         weight_decay      = 0.0001,
-        threshold         = 7.0,
     )
 
     print("Save history")
