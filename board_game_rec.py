@@ -78,6 +78,22 @@ class BoardGameRecommender(nn.Module):
     ):
         super(BoardGameRecommender, self).__init__()
 
+        # Persist hyperparams so checkpoints can be self-describing.
+        # load_assets() in recommend.py reads these back to reconstruct the
+        # model without relying on hardcoded defaults.
+        self.hparams = {
+            "num_users":              num_users,
+            "num_games":              num_games,
+            "num_categories":         num_categories,
+            "num_mechanics":          num_mechanics,
+            "dropout_rate":           dropout_rate,
+            "embedding_user_dim":     embedding_user_dim,
+            "embedding_game_dim":     embedding_game_dim,
+            "embedding_category_dim": embedding_category_dim,
+            "embedding_mechanic_dim": embedding_mechanic_dim,
+            "hidden_dim":             hidden_dim,
+        }
+
         # Number of scaled numeric features passed through the forward method:
         # avg_usr_rating, avg_usr_weight, bayes_average, age, game_owners
         self.num_numeric_features = 5
@@ -710,7 +726,10 @@ def train_model(
         history["validation_r2"].append(avg_val_r2)
         history["learning_rate"].append(current_lr)
 
-        torch.save(model.state_dict(), config["models"]["recommender"].format(epoch + 1))
+        torch.save(
+            {"state_dict": model.state_dict(), "hparams": model.hparams},
+            config["models"]["recommender"].format(epoch + 1),
+        )
 
     return model, history
 
