@@ -39,14 +39,23 @@ def load_assets(config: dict, epoch: int, device: torch.device) -> tuple:
 
     # Model
     checkpoint_path = config["models"]["recommender"].format(epoch)
-    model = bgr.BoardGameRecommender(
-        num_users      = len(user_encoder),
-        num_games      = len(game_encoder),
-        num_categories = len(category_encoder),
-        num_mechanics  = len(mechanic_encoder),
-        dropout_rate   = 0.2,
-    )
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "hparams" in checkpoint:
+        # New-style checkpoint: self-describing with saved hyperparams
+        hparams    = checkpoint["hparams"]
+        state_dict = checkpoint["state_dict"]
+    else:
+        # Backward-compatible fallback for old bare state_dict checkpoints
+        hparams = dict(
+            num_users      = len(user_encoder),
+            num_games      = len(game_encoder),
+            num_categories = len(category_encoder),
+            num_mechanics  = len(mechanic_encoder),
+        )
+        state_dict = checkpoint
+
+    model = bgr.BoardGameRecommender(**hparams)
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
