@@ -70,11 +70,11 @@ class BoardGameRecommender(nn.Module):
         num_categories,
         num_mechanics,
         dropout_rate=0.2,
-        embedding_user_dim=128,
-        embedding_game_dim=32,
-        embedding_category_dim=8,
-        embedding_mechanic_dim=16,
-        hidden_dim=64,
+        embedding_user_dim=512,
+        embedding_game_dim=128,
+        embedding_category_dim=32,
+        embedding_mechanic_dim=64,
+        hidden_dim=256,
     ):
         super(BoardGameRecommender, self).__init__()
 
@@ -113,9 +113,13 @@ class BoardGameRecommender(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout_rate)
+        # Pyramid MLP: embedding_dim → embedding_dim → hidden_dim → hidden_dim//2 → 1
+        # The first layer is same-size (no compression) to let the model mix
+        # embedding signals freely before the pyramid begins.
         self.fc1 = nn.Linear(self.embedding_dim, self.embedding_dim)
         self.fc2 = nn.Linear(self.embedding_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc4 = nn.Linear(hidden_dim // 2, 1)
         self.relu = nn.ReLU()
 
     def forward(
@@ -163,7 +167,9 @@ class BoardGameRecommender(nn.Module):
         x = self.dropout(x)
         x = self.relu(self.fc2(x))
         x = self.dropout(x)
-        return self.fc3(x)
+        x = self.relu(self.fc3(x))
+        x = self.dropout(x)
+        return self.fc4(x)
 
 
 class UserGameDataSet(Dataset):
@@ -782,12 +788,12 @@ def main():
         num_games       = len(game_encoder),
         num_categories  = len(category_encoder),
         num_mechanics   = len(mechanic_encoder),
-        dropout_rate        = 0.2,
-        embedding_user_dim  = 128,
-        embedding_game_dim  = 32,
-        embedding_category_dim = 8,
-        embedding_mechanic_dim = 16,
-        hidden_dim      = 64,
+        dropout_rate           = 0.2,
+        embedding_user_dim     = 512,
+        embedding_game_dim     = 128,
+        embedding_category_dim = 32,
+        embedding_mechanic_dim = 64,
+        hidden_dim             = 256,
     ).to(DEVICE)
 
     # ── Training ─────────────────────────────────────────────────────────────
