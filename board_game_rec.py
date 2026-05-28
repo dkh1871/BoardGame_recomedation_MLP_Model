@@ -37,6 +37,7 @@ import torchmetrics.functional as tmf
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch import nn
+from torch.amp import GradScaler
 from sklearn import model_selection
 from sklearn.preprocessing import StandardScaler
 
@@ -69,7 +70,7 @@ class BoardGameRecommender(nn.Module):
         num_games,
         num_categories,
         num_mechanics,
-        dropout_rate=0.2,
+        dropout_rate=0.3,
         embedding_user_dim=512,
         embedding_game_dim=128,
         embedding_category_dim=32,
@@ -534,6 +535,7 @@ def get_data_loaders(
     test_data: pd.DataFrame,
     batch_size: int = 100,
     num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     '''
     Creates and returns DataLoaders for the train, validation, and test sets.
@@ -544,9 +546,9 @@ def get_data_loaders(
     test_dataset       = UserGameDataSet(test_data)
 
     print("Create data loaders")
-    train_loader      = DataLoader(train_dataset,      batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn)
-    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
-    test_loader       = DataLoader(test_dataset,       batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
+    train_loader      = DataLoader(train_dataset,      batch_size=batch_size, shuffle=True,  num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
+    validation_loader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
+    test_loader       = DataLoader(test_dataset,       batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn, pin_memory=pin_memory)
     return train_loader, validation_loader, test_loader
 
 
@@ -589,6 +591,7 @@ def _run_epoch(
     epochs: int,
     log_progress_step: int,
     optimizer: torch.optim.Optimizer = None,
+    scaler: GradScaler = None,
 ) -> tuple[float, float, float, float]:
     '''
     Runs one full pass over `loader` and returns epoch-average metrics.
@@ -620,31 +623,35 @@ def _run_epoch(
             if is_training:
                 optimizer.zero_grad()
 
-            x = model(
-                user_id          = batch["users_id"],
-                game_id          = batch["game_id"],
-                avg_usr_rating   = batch["avg_usr_rating"],
-                avg_usr_weight   = batch["avg_usr_weight"],
-                bayes_average    = batch["bayes_average"],
-                age              = batch["age"],
-                game_owners      = batch["game_owners"],
-                category_indices = batch["category_indices"],
-                category_offsets = batch["category_offsets"],
-                mechanic_indices = batch["mechanic_indices"],
-                mechanic_offsets = batch["mechanic_offsets"],
-            ).squeeze()
+            with torch.autocast(device_type=DEVICE.type, dtype=torch.float16,
+                                 enabled=(DEVICE.type == "cuda")):
+                x = model(
+                    user_id          = batch["users_id"],
+                    game_id          = batch["game_id"],
+                    avg_usr_rating   = batch["avg_usr_rating"],
+                    avg_usr_weight   = batch["avg_usr_weight"],
+                    bayes_average    = batch["bayes_average"],
+                    age              = batch["age"],
+                    game_owners      = batch["game_owners"],
+                    category_indices = batch["category_indices"],
+                    category_offsets = batch["category_offsets"],
+                    mechanic_indices = batch["mechanic_indices"],
+                    mechanic_offsets = batch["mechanic_offsets"],
+                ).squeeze()
+                out_true = batch["user_rating"].to(torch.float32)
+                loss = criterion(x, out_true)
 
-            out_true = batch["user_rating"].to(torch.float32)
-            loss = criterion(x, out_true)
             total_loss += loss.item()
 
             if is_training:
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
-            total_nrmse += tmf.normalized_root_mean_squared_error(x, out_true, normalization='range').item()
-            total_mae   += tmf.mean_absolute_error(x, out_true).item()
-            total_r2    += tmf.r2_score(x, out_true).item()
+            x_f32 = x.float()
+            total_nrmse += tmf.normalized_root_mean_squared_error(x_f32, out_true, normalization='range').item()
+            total_mae   += tmf.mean_absolute_error(x_f32, out_true).item()
+            total_r2    += tmf.r2_score(x_f32, out_true).item()
 
             # Log every log_progress_step batches using the running average
             # up to this point.  step_count+1 is the number of batches seen.
@@ -686,8 +693,10 @@ def train_model(
         factor    = 0.5,     # halve the LR on each trigger
         patience  = 2,       # wait 2 epochs of no improvement before reducing
         min_lr    = 1e-6,    # floor so LR never reaches zero
+        threshold = 0.005,   # require 0.5% improvement to count as real progress
     )
     criterion         = nn.MSELoss()
+    scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
     log_progress_step = 50
 
     history = {
@@ -706,7 +715,7 @@ def train_model(
     for epoch in range(epochs):
         avg_train_loss, avg_train_nrmse, avg_train_mae, avg_train_r2 = _run_epoch(
             model, train_loader, criterion,
-            epoch, epochs, log_progress_step, optimizer,
+            epoch, epochs, log_progress_step, optimizer, scaler=scaler,
         )
         avg_val_loss, avg_val_nrmse, avg_val_mae, avg_val_r2 = _run_epoch(
             model, validation_loader, criterion,
@@ -774,7 +783,9 @@ def main():
     # ── DataLoaders ──────────────────────────────────────────────────────────
     print("Get Data Loaders")
     train_loader, validation_loader, test_loader = get_data_loaders(
-        train_data, validation_data, test_data, batch_size=1000
+        train_data, validation_data, test_data,
+        batch_size=2048,
+        pin_memory=(DEVICE.type == "cuda"),
     )
     del train_data, validation_data, test_data
 
@@ -788,7 +799,7 @@ def main():
         num_games       = len(game_encoder),
         num_categories  = len(category_encoder),
         num_mechanics   = len(mechanic_encoder),
-        dropout_rate           = 0.2,
+        dropout_rate           = 0.3,
         embedding_user_dim     = 512,
         embedding_game_dim     = 128,
         embedding_category_dim = 32,
@@ -803,8 +814,8 @@ def main():
         train_loader      = train_loader,
         validation_loader = validation_loader,
         config            = config,
-        epochs            = 10,
-        learning_rate     = 0.001,
+        epochs            = 20,
+        learning_rate     = 0.0003,
         weight_decay      = 0.0001,
     )
 
