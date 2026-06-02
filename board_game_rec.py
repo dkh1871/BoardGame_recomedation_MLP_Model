@@ -32,6 +32,7 @@ import json
 import os
 import joblib
 
+import torchmetrics
 import torchmetrics.functional as tmf
 
 from torch.utils.data import Dataset
@@ -219,18 +220,18 @@ def collate_fn(batch):
     mechanic_indices, mechanic_offsets = get_embedding_bag(batch, 'mechanic_indices')
 
     return {
-        "users_id":        torch.stack([b["users_id"]        for b in batch]).to(DEVICE),
-        "game_id":         torch.stack([b["game_id"]         for b in batch]).to(DEVICE),
-        "user_rating":     torch.stack([b["user_rating"]     for b in batch]).to(DEVICE),
-        "avg_usr_rating":  torch.stack([b["avg_usr_rating"]  for b in batch]).to(DEVICE),
-        "avg_usr_weight":  torch.stack([b["avg_usr_weight"]  for b in batch]).to(DEVICE),
-        "bayes_average":   torch.stack([b["bayes_average"]   for b in batch]).to(DEVICE),
-        "age":             torch.stack([b["age"]             for b in batch]).to(DEVICE),
-        "game_owners":     torch.stack([b["game_owners"]     for b in batch]).to(DEVICE),
-        "category_indices": category_indices.to(DEVICE),
-        "category_offsets": category_offsets.to(DEVICE),
-        "mechanic_indices": mechanic_indices.to(DEVICE),
-        "mechanic_offsets": mechanic_offsets.to(DEVICE),
+        "users_id":        torch.stack([b["users_id"]        for b in batch]),
+        "game_id":         torch.stack([b["game_id"]         for b in batch]),
+        "user_rating":     torch.stack([b["user_rating"]     for b in batch]),
+        "avg_usr_rating":  torch.stack([b["avg_usr_rating"]  for b in batch]),
+        "avg_usr_weight":  torch.stack([b["avg_usr_weight"]  for b in batch]),
+        "bayes_average":   torch.stack([b["bayes_average"]   for b in batch]),
+        "age":             torch.stack([b["age"]             for b in batch]),
+        "game_owners":     torch.stack([b["game_owners"]     for b in batch]),
+        "category_indices": category_indices,
+        "category_offsets": category_offsets,
+        "mechanic_indices": mechanic_indices,
+        "mechanic_offsets": mechanic_offsets,
     }
 
 
@@ -612,7 +613,7 @@ def _run_epoch(
     total_loss  = 0.0
     total_nrmse = 0.0
     total_mae   = 0.0
-    total_r2    = 0.0
+    r2_metric   = torchmetrics.R2Score().to(DEVICE)
     step_count  = 0
     data_size   = len(loader)
 
@@ -620,6 +621,7 @@ def _run_epoch(
     grad_ctx = contextlib.nullcontext() if is_training else torch.no_grad()
     with grad_ctx:
         for batch in loader:
+            batch = {k: v.to(DEVICE) for k, v in batch.items()}
             if is_training:
                 optimizer.zero_grad()
 
@@ -648,10 +650,11 @@ def _run_epoch(
                 scaler.step(optimizer)
                 scaler.update()
 
-            x_f32 = x.float()
-            total_nrmse += tmf.normalized_root_mean_squared_error(x_f32, out_true, normalization='range').item()
-            total_mae   += tmf.mean_absolute_error(x_f32, out_true).item()
-            total_r2    += tmf.r2_score(x_f32, out_true).item()
+            x_f32 = x.detach().float()
+            y     = out_true.float()
+            total_nrmse += tmf.normalized_root_mean_squared_error(x_f32, y, normalization='range').item()
+            total_mae   += tmf.mean_absolute_error(x_f32, y).item()
+            r2_metric.update(x_f32, y)
 
             # Log every log_progress_step batches using the running average
             # up to this point.  step_count+1 is the number of batches seen.
@@ -659,12 +662,12 @@ def _run_epoch(
                 n = step_count + 1
                 log_progress(
                     epoch, epochs, step_count,
-                    total_loss / n, total_nrmse / n, total_mae / n, total_r2 / n,
+                    total_loss / n, total_nrmse / n, total_mae / n, r2_metric.compute().item(),
                     data_size,
                 )
             step_count += 1
 
-    return total_loss / data_size, total_nrmse / data_size, total_mae / data_size, total_r2 / data_size
+    return total_loss / data_size, total_nrmse / data_size, total_mae / data_size, r2_metric.compute().item()
 
 
 def train_model(
@@ -674,7 +677,7 @@ def train_model(
     config: dict,
     epochs: int = 10,
     learning_rate: float = 0.001,
-    weight_decay: float = 0.0001,
+    weight_decay: float = 0.001,
 ) -> tuple[nn.Module, dict]:
     '''
     Trains the model and saves a checkpoint after each epoch.
@@ -692,7 +695,7 @@ def train_model(
         mode      = 'min',   # reduce when monitored metric stops decreasing
         factor    = 0.5,     # halve the LR on each trigger
         patience  = 2,       # wait 2 epochs of no improvement before reducing
-        min_lr    = 1e-6,    # floor so LR never reaches zero
+        min_lr    = 5e-5,    # floor so LR never reaches zero
         threshold = 0.005,   # require 0.5% improvement to count as real progress
     )
     criterion         = nn.MSELoss()
@@ -785,7 +788,6 @@ def main():
     train_loader, validation_loader, test_loader = get_data_loaders(
         train_data, validation_data, test_data,
         batch_size=2048,
-        pin_memory=(DEVICE.type == "cuda"),
     )
     del train_data, validation_data, test_data
 
