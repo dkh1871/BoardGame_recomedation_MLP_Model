@@ -72,11 +72,11 @@ class BoardGameRecommender(nn.Module):
         num_categories,
         num_mechanics,
         dropout_rate=0.3,
-        embedding_user_dim=512,
-        embedding_game_dim=128,
-        embedding_category_dim=32,
-        embedding_mechanic_dim=64,
-        hidden_dim=256,
+        embedding_user_dim=256,
+        embedding_game_dim=64,
+        embedding_category_dim=16,
+        embedding_mechanic_dim=32,
+        hidden_dim=128,
     ):
         super(BoardGameRecommender, self).__init__()
 
@@ -401,9 +401,9 @@ def get_game_data(config: dict) -> pd.DataFrame:
     cache_is_valid = False
     if os.path.exists(game_data_model_path):
         game_data = pd.read_csv(game_data_model_path)
-        # Guard: if game_id_encoded is entirely NaN the cache is stale
-        # (written before the str-key encoder fix). Wipe it and start fresh.
-        if "game_id_encoded" not in game_data.columns or game_data["game_id_encoded"].isna().all():
+        # Guard: any NaN in game_id_encoded means the cache is corrupt or stale.
+        # Every game should have a valid encoded ID, so even one NaN is wrong.
+        if "game_id_encoded" not in game_data.columns or game_data["game_id_encoded"].isna().any():
             print("WARNING: cached game_data_model.csv has invalid game_id_encoded — regenerating.")
             os.remove(game_data_model_path)
             game_data = process_game_data(game_data_file)
@@ -802,11 +802,11 @@ def main():
         num_categories  = len(category_encoder),
         num_mechanics   = len(mechanic_encoder),
         dropout_rate           = 0.3,
-        embedding_user_dim     = 512,
-        embedding_game_dim     = 128,
-        embedding_category_dim = 32,
-        embedding_mechanic_dim = 64,
-        hidden_dim             = 256,
+        embedding_user_dim     = 256,
+        embedding_game_dim     = 64,
+        embedding_category_dim = 16,
+        embedding_mechanic_dim = 32,
+        hidden_dim             = 128,
     ).to(DEVICE)
 
     # ── Training ─────────────────────────────────────────────────────────────
