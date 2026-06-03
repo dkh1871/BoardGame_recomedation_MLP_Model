@@ -698,7 +698,7 @@ def train_model(
         min_lr    = 5e-5,    # floor so LR never reaches zero
         threshold = 0.005,   # require 0.5% improvement to count as real progress
     )
-    criterion         = nn.MSELoss()
+    criterion         = nn.HuberLoss(delta=1.0)
     scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
     log_progress_step = 50
 
@@ -818,7 +818,7 @@ def main():
         config            = config,
         epochs            = 20,
         learning_rate     = 0.0003,
-        weight_decay      = 0.0001,
+        weight_decay      = 0.0003,
     )
 
     print("Save history")
