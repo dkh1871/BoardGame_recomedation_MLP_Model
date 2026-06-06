@@ -78,6 +78,7 @@ class BoardGameRecommender(nn.Module):
         embedding_category_dim=16,
         embedding_mechanic_dim=32,
         hidden_dim=128,
+        gmf_dim=32,
     ):
         super(BoardGameRecommender, self).__init__()
 
@@ -95,17 +96,22 @@ class BoardGameRecommender(nn.Module):
             "embedding_category_dim": embedding_category_dim,
             "embedding_mechanic_dim": embedding_mechanic_dim,
             "hidden_dim":             hidden_dim,
+            "gmf_dim":                gmf_dim,
         }
 
         # Number of scaled numeric features passed through the forward method:
         # avg_usr_rating, avg_usr_weight, bayes_average, age, game_owners
         self.num_numeric_features = 5
 
-        # Embedding layers
-        self.user_embedding = nn.Embedding(num_users, embedding_user_dim)
-        self.game_embedding = nn.Embedding(num_games, embedding_game_dim)
+        # MLP branch embeddings
+        self.user_embedding_mlp = nn.Embedding(num_users, embedding_user_dim)
+        self.game_embedding_mlp = nn.Embedding(num_games, embedding_game_dim)
         self.category_embedding = nn.EmbeddingBag(num_categories, embedding_category_dim, mode="mean")
         self.mechanic_embedding = nn.EmbeddingBag(num_mechanics, embedding_mechanic_dim, mode="mean")
+
+        # GMF branch embeddings — separate representations for linear user-game alignment
+        self.user_embedding_gmf = nn.Embedding(num_users, gmf_dim)
+        self.game_embedding_gmf = nn.Embedding(num_games, gmf_dim)
 
         self.embedding_dim = (
             embedding_user_dim
@@ -116,13 +122,12 @@ class BoardGameRecommender(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout_rate)
-        # Pyramid MLP: embedding_dim → embedding_dim → hidden_dim → hidden_dim//2 → 1
-        # The first layer is same-size (no compression) to let the model mix
-        # embedding signals freely before the pyramid begins.
+        # MLP pyramid: embedding_dim → embedding_dim → hidden_dim → hidden_dim//2
         self.fc1 = nn.Linear(self.embedding_dim, self.embedding_dim)
         self.fc2 = nn.Linear(self.embedding_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.fc4 = nn.Linear(hidden_dim // 2, 1)
+        # Final layer combines MLP output and GMF output
+        self.fc_out = nn.Linear(hidden_dim // 2 + gmf_dim, 1)
         self.relu = nn.ReLU()
 
     def forward(
@@ -155,9 +160,10 @@ class BoardGameRecommender(nn.Module):
         - mechanic_indices: the indices of the mechanics of the game
         - mechanic_offsets: the offsets of the mechanics of the game
         """
+        # MLP branch
         x = torch.cat([
-            self.user_embedding(user_id),
-            self.game_embedding(game_id),
+            self.user_embedding_mlp(user_id),
+            self.game_embedding_mlp(game_id),
             self.category_embedding(category_indices, category_offsets),
             self.mechanic_embedding(mechanic_indices, mechanic_offsets),
             avg_usr_rating.unsqueeze(1),
@@ -166,13 +172,14 @@ class BoardGameRecommender(nn.Module):
             age.unsqueeze(1),
             game_owners.unsqueeze(1),
         ], dim=1)
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = self.relu(self.fc3(x))
-        x = self.dropout(x)
-        return self.fc4(x)
+        x = self.dropout(self.relu(self.fc1(x)))
+        x = self.dropout(self.relu(self.fc2(x)))
+        x = self.dropout(self.relu(self.fc3(x)))
+
+        # GMF branch — element-wise product captures linear user-game alignment
+        gmf = self.user_embedding_gmf(user_id) * self.game_embedding_gmf(game_id)
+
+        return self.fc_out(torch.cat([x, gmf], dim=1))
 
 
 class UserGameDataSet(Dataset):
@@ -877,6 +884,7 @@ def main():
             embedding_category_dim = 16,
             embedding_mechanic_dim = 32,
             hidden_dim             = 128,
+            gmf_dim                = 32,
         ).to(DEVICE)
 
     # ── Training ─────────────────────────────────────────────────────────────
