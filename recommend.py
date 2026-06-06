@@ -131,9 +131,11 @@ def recommend(
         collate_fn  = bgr.collate_fn,
     )
 
+    device = next(model.parameters()).device
     all_preds = []
     with torch.no_grad():
         for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
             preds = model(
                 user_id          = batch["users_id"],
                 game_id          = batch["game_id"],
