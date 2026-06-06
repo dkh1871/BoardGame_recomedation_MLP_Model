@@ -128,6 +128,9 @@ class BoardGameRecommender(nn.Module):
         self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
         # Final layer combines MLP output and GMF output
         self.fc_out = nn.Linear(hidden_dim // 2 + gmf_dim, 1)
+        self.bn1 = nn.BatchNorm1d(self.embedding_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
         self.relu = nn.ReLU()
 
     def forward(
@@ -172,9 +175,9 @@ class BoardGameRecommender(nn.Module):
             age.unsqueeze(1),
             game_owners.unsqueeze(1),
         ], dim=1)
-        x = self.dropout(self.relu(self.fc1(x)))
-        x = self.dropout(self.relu(self.fc2(x)))
-        x = self.dropout(self.relu(self.fc3(x)))
+        x = self.dropout(self.relu(self.bn1(self.fc1(x))))
+        x = self.dropout(self.relu(self.bn2(self.fc2(x))))
+        x = self.dropout(self.relu(self.bn3(self.fc3(x))))
 
         # GMF branch — element-wise product captures linear user-game alignment
         gmf = self.user_embedding_gmf(user_id) * self.game_embedding_gmf(game_id)
@@ -721,13 +724,10 @@ def train_model(
     escape the early plateau seen in longer training runs.
     '''
     optimizer  = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler  = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode      = 'min',   # reduce when monitored metric stops decreasing
-        factor    = 0.5,     # halve the LR on each trigger
-        patience  = 4,       # wait 4 epochs of no improvement before reducing
-        min_lr    = 5e-5,    # floor so LR never reaches zero
-        threshold = 0.005,   # require 0.5% improvement to count as real progress
+        T_max   = epochs,   # decay over the full training run
+        eta_min = 1e-5,     # minimum LR at the end of the cosine cycle
     )
     criterion         = nn.HuberLoss(delta=1.0)
     scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
@@ -761,9 +761,8 @@ def train_model(
             epoch, epochs, log_progress_step,
         )
 
-        # Step the scheduler on validation loss; must come before reading the LR
-        # so the history records the LR that will be used next epoch.
-        scheduler.step(avg_val_loss)
+        # Step the cosine schedule unconditionally each epoch.
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
 
         print(f"Epoch {epoch+1}/{epochs} — Train Loss: {avg_train_loss:.6f}  Val Loss: {avg_val_loss:.6f}"
