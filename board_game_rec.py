@@ -21,6 +21,7 @@
 # was written by me.
 ########################################################################################
 
+import argparse
 import contextlib
 import torch
 import pandas as pd
@@ -678,6 +679,9 @@ def train_model(
     epochs: int = 10,
     learning_rate: float = 0.001,
     weight_decay: float = 0.001,
+    start_epoch: int = 0,
+    resume_optimizer: dict = None,
+    resume_scheduler: dict = None,
 ) -> tuple[nn.Module, dict]:
     '''
     Trains the model and saves a checkpoint after each epoch.
@@ -694,12 +698,17 @@ def train_model(
         optimizer,
         mode      = 'min',   # reduce when monitored metric stops decreasing
         factor    = 0.5,     # halve the LR on each trigger
-        patience  = 2,       # wait 2 epochs of no improvement before reducing
+        patience  = 4,       # wait 4 epochs of no improvement before reducing
         min_lr    = 5e-5,    # floor so LR never reaches zero
         threshold = 0.005,   # require 0.5% improvement to count as real progress
     )
     criterion         = nn.HuberLoss(delta=1.0)
     scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
+
+    if resume_optimizer is not None:
+        optimizer.load_state_dict(resume_optimizer)
+    if resume_scheduler is not None:
+        scheduler.load_state_dict(resume_scheduler)
     log_progress_step = 50
 
     history = {
@@ -715,7 +724,7 @@ def train_model(
     }
 
     print(f"Training model for {epochs} epochs")
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, start_epoch + epochs):
         avg_train_loss, avg_train_nrmse, avg_train_mae, avg_train_r2 = _run_epoch(
             model, train_loader, criterion,
             epoch, epochs, log_progress_step, optimizer, scaler=scaler,
@@ -745,7 +754,13 @@ def train_model(
         history["learning_rate"].append(current_lr)
 
         torch.save(
-            {"state_dict": model.state_dict(), "hparams": model.hparams},
+            {
+                "state_dict": model.state_dict(),
+                "hparams":    model.hparams,
+                "optimizer":  optimizer.state_dict(),
+                "scheduler":  scheduler.state_dict(),
+                "epoch":      epoch + 1,
+            },
             config["models"]["recommender"].format(epoch + 1),
         )
 
@@ -753,6 +768,16 @@ def train_model(
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train the board game recommender.")
+    parser.add_argument(
+        "--resume-from", type=int, default=None,
+        help="Epoch checkpoint to resume training from (e.g. --resume-from 40).",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=40,
+        help="Number of epochs to train (default: 40).",
+    )
+    args = parser.parse_args()
 
     print("Setup config")
     config = setup_config("config/config.json")
@@ -795,31 +820,67 @@ def main():
     print("Get Encoders")
     user_encoder, game_encoder, category_encoder, mechanic_encoder = get_encoders(config)
 
-    print(f"Instantiate model (device: {DEVICE})")
-    model = BoardGameRecommender(
-        num_users       = len(user_encoder),
-        num_games       = len(game_encoder),
-        num_categories  = len(category_encoder),
-        num_mechanics   = len(mechanic_encoder),
-        dropout_rate           = 0.3,
-        embedding_user_dim     = 256,
-        embedding_game_dim     = 64,
-        embedding_category_dim = 16,
-        embedding_mechanic_dim = 32,
-        hidden_dim             = 128,
-    ).to(DEVICE)
+    # ── Resume or fresh start ────────────────────────────────────────────────
+    start_epoch      = 0
+    resume_optimizer = None
+    resume_scheduler = None
+    existing_history = None
+    learning_rate    = 0.0003
+
+    if args.resume_from is not None:
+        checkpoint_path = config["models"]["recommender"].format(args.resume_from)
+        print(f"Resuming from epoch {args.resume_from}: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+        model = BoardGameRecommender(**ckpt["hparams"]).to(DEVICE)
+        model.load_state_dict(ckpt["state_dict"])
+        start_epoch      = args.resume_from
+        resume_optimizer = ckpt.get("optimizer")
+        resume_scheduler = ckpt.get("scheduler")
+        history_path = config["models"]["history"]
+        if os.path.exists(history_path):
+            with open(history_path, "r", encoding="utf-8") as f:
+                existing_history = json.load(f)
+            if resume_optimizer is None and existing_history.get("learning_rate"):
+                learning_rate = existing_history["learning_rate"][-1]
+                print(f"No optimizer state in checkpoint — using last recorded LR: {learning_rate:.2e}")
+    else:
+        print(f"Instantiate model (device: {DEVICE})")
+        model = BoardGameRecommender(
+            num_users              = len(user_encoder),
+            num_games              = len(game_encoder),
+            num_categories         = len(category_encoder),
+            num_mechanics          = len(mechanic_encoder),
+            dropout_rate           = 0.3,
+            embedding_user_dim     = 256,
+            embedding_game_dim     = 64,
+            embedding_category_dim = 16,
+            embedding_mechanic_dim = 32,
+            hidden_dim             = 128,
+        ).to(DEVICE)
 
     # ── Training ─────────────────────────────────────────────────────────────
     print("Train model")
-    model, history = train_model(
+    model, new_history = train_model(
         model             = model,
         train_loader      = train_loader,
         validation_loader = validation_loader,
         config            = config,
-        epochs            = 20,
-        learning_rate     = 0.0003,
+        epochs            = args.epochs,
+        learning_rate     = learning_rate,
         weight_decay      = 0.0003,
+        start_epoch       = start_epoch,
+        resume_optimizer  = resume_optimizer,
+        resume_scheduler  = resume_scheduler,
     )
+
+    # Merge histories when resuming so the full training arc is preserved.
+    if existing_history is not None:
+        for key in existing_history:
+            if key in new_history:
+                existing_history[key].extend(new_history[key])
+        history = existing_history
+    else:
+        history = new_history
 
     print("Save history")
     with open(config["models"]["history"], "w", encoding="utf-8") as f:
