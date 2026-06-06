@@ -523,6 +523,26 @@ def create_train_data(
     train_data, test_data       = model_selection.train_test_split(game_data_model, test_size=0.2,  random_state=42)
     train_data, validation_data = model_selection.train_test_split(train_data,      test_size=0.2,  random_state=42)
 
+    # Compute user mean ratings from training data only — using val/test would
+    # leak future information into the normalization.
+    user_means  = train_data.groupby('user_id')['user_rating'].mean()
+    global_mean = float(user_means.mean())
+
+    # Subtract each user's mean so the model learns relative preferences.
+    # Users present in val/test but not in train fall back to the global mean.
+    for df in (train_data, validation_data, test_data):
+        df['user_rating'] = (
+            df['user_rating'] - df['user_id'].map(user_means).fillna(global_mean)
+        )
+
+    user_means_df = (
+        user_means.reset_index()
+                  .rename(columns={'user_rating': 'mean_rating'})
+    )
+    user_means_df['global_mean'] = global_mean
+    user_means_df.to_csv(config["data_model"]["user_means_path"], index=False)
+    print(f"User means saved ({len(user_means_df):,} users, global mean: {global_mean:.3f})")
+
     print("Save train, validation, and test sets")
     train_data.to_csv(     config["data_model"]["train_data_path"],      index=False)
     validation_data.to_csv(config["data_model"]["validation_data_path"], index=False)
@@ -788,6 +808,7 @@ def main():
         os.path.exists(config["data_model"]["train_data_path"])
         and os.path.exists(config["data_model"]["validation_data_path"])
         and os.path.exists(config["data_model"]["test_data_path"])
+        and os.path.exists(config["data_model"]["user_means_path"])
     ):
         print("Loading cached train / validation / test sets")
         train_data      = pd.read_csv(config["data_model"]["train_data_path"])

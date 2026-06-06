@@ -70,6 +70,8 @@ def recommend(
     game_data: pd.DataFrame,
     user_data: pd.DataFrame,
     model: torch.nn.Module,
+    user_means: dict,
+    global_mean: float,
     top_k: int = 10,
     exclude_rated: bool = True,
     batch_size: int = 1000,
@@ -84,6 +86,8 @@ def recommend(
     game_data     : Pre-processed game catalogue DataFrame.
     user_data     : Pre-processed user ratings DataFrame.
     model         : Trained BoardGameRecommender model.
+    user_means    : Dict mapping encoded user_id to that user's mean training rating.
+    global_mean   : Fallback mean used for users not in user_means.
     top_k         : Number of recommendations to return.
     exclude_rated : If True, games the user has already rated are excluded.
     batch_size    : Inference batch size.
@@ -151,7 +155,12 @@ def recommend(
             ).cpu().numpy().flatten()
             all_preds.extend(preds.tolist())
 
-    infer_df["predicted_rating"] = all_preds
+    # Model predicts residuals — add the user's mean rating back to get
+    # predictions on the original 1–10 scale, then clamp to valid range.
+    user_mean = user_means.get(user_id_enc, global_mean)
+    infer_df["predicted_rating"] = (
+        pd.Series(all_preds) + user_mean
+    ).clip(lower=1.0, upper=10.0).values
 
     results = (
         infer_df
@@ -271,6 +280,9 @@ def main():
 
     try:
         user_encoder, game_data, user_data, model = load_assets(config, args.epoch, device)
+        user_means_df  = pd.read_csv(config["data_model"]["user_means_path"])
+        global_mean    = float(user_means_df["global_mean"].iloc[0])
+        user_means_map = dict(zip(user_means_df["user_id"], user_means_df["mean_rating"]))
     except FileNotFoundError as e:
         sys.exit(f"ERROR: {e}\nRun board_game_rec.py first to generate the required files.")
 
@@ -310,6 +322,8 @@ def main():
             game_data     = game_data,
             user_data     = user_data,
             model         = model,
+            user_means    = user_means_map,
+            global_mean   = global_mean,
             top_k         = args.top_k,
             exclude_rated = not args.include_rated,
         )
