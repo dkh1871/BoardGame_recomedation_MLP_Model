@@ -73,7 +73,7 @@ class BoardGameRecommender(nn.Module):
         num_categories,
         num_mechanics,
         dropout_rate=0.3,
-        embedding_user_dim=256,
+        embedding_user_dim=128,
         embedding_game_dim=64,
         embedding_category_dim=16,
         embedding_mechanic_dim=32,
@@ -476,7 +476,7 @@ def get_user_data(config: dict) -> pd.DataFrame:
     else:
         user_data = pd.read_csv(user_data_model_path)
 
-    user_encoder = create_encoder(user_encoder_path, user_data['user'].unique(), "user")
+    user_encoder = create_encoder(user_encoder_path, user_data['user'].dropna().unique(), "user")
 
     print("Prep user data for training")
     if not os.path.exists(user_data_model_path):
@@ -622,6 +622,7 @@ def _run_epoch(
     epoch: int,
     epochs: int,
     log_progress_step: int,
+    r2_metric: torchmetrics.R2Score,
     optimizer: torch.optim.Optimizer = None,
     scaler: GradScaler = None,
 ) -> tuple[float, float, float, float]:
@@ -644,7 +645,7 @@ def _run_epoch(
     total_loss  = 0.0
     total_nrmse = 0.0
     total_mae   = 0.0
-    r2_metric   = torchmetrics.R2Score().to(DEVICE)
+    r2_metric.reset()
     step_count  = 0
     data_size   = len(loader)
 
@@ -726,11 +727,12 @@ def train_model(
     optimizer  = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max   = epochs,   # decay over the full training run
-        eta_min = 1e-5,     # minimum LR at the end of the cosine cycle
+        T_max   = start_epoch + epochs,  # total epochs so resumed runs continue the cosine cycle
+        eta_min = 1e-5,
     )
-    criterion         = nn.HuberLoss(delta=1.0)
+    criterion         = nn.HuberLoss(delta=0.5)
     scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
+    r2_metric         = torchmetrics.R2Score().to(DEVICE)
 
     if resume_optimizer is not None:
         optimizer.load_state_dict(resume_optimizer)
@@ -754,11 +756,11 @@ def train_model(
     for epoch in range(start_epoch, start_epoch + epochs):
         avg_train_loss, avg_train_nrmse, avg_train_mae, avg_train_r2 = _run_epoch(
             model, train_loader, criterion,
-            epoch, epochs, log_progress_step, optimizer, scaler=scaler,
+            epoch, epochs, log_progress_step, r2_metric, optimizer, scaler=scaler,
         )
         avg_val_loss, avg_val_nrmse, avg_val_mae, avg_val_r2 = _run_epoch(
             model, validation_loader, criterion,
-            epoch, epochs, log_progress_step,
+            epoch, epochs, log_progress_step, r2_metric,
         )
 
         # Step the cosine schedule unconditionally each epoch.
@@ -895,7 +897,7 @@ def main():
         config            = config,
         epochs            = args.epochs,
         learning_rate     = learning_rate,
-        weight_decay      = 0.0003,
+        weight_decay      = 0.0001,
         start_epoch       = start_epoch,
         resume_optimizer  = resume_optimizer,
         resume_scheduler  = resume_scheduler,
