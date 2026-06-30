@@ -100,8 +100,9 @@ class BoardGameRecommender(nn.Module):
         }
 
         # Number of scaled numeric features passed through the forward method:
-        # avg_usr_rating, avg_usr_weight, bayes_average, age, game_owners
-        self.num_numeric_features = 5
+        # avg_usr_rating, avg_usr_weight, bayes_average, age, game_owners,
+        # user_rating_count, user_rating_std
+        self.num_numeric_features = 7
 
         # MLP branch embeddings
         self.user_embedding_mlp = nn.Embedding(num_users, embedding_user_dim)
@@ -142,6 +143,8 @@ class BoardGameRecommender(nn.Module):
         bayes_average,
         age,
         game_owners,
+        user_rating_count,
+        user_rating_std,
         category_indices,
         category_offsets,
         mechanic_indices,
@@ -174,6 +177,8 @@ class BoardGameRecommender(nn.Module):
             bayes_average.unsqueeze(1),
             age.unsqueeze(1),
             game_owners.unsqueeze(1),
+            user_rating_count.unsqueeze(1),
+            user_rating_std.unsqueeze(1),
         ], dim=1)
         x = self.dropout(self.relu(self.bn1(self.fc1(x))))
         x = self.dropout(self.relu(self.bn2(self.fc2(x))))
@@ -201,6 +206,8 @@ class UserGameDataSet(Dataset):
         self.bayes_average = data["bayes_average_scaled"]
         self.age = data["age_scaled"]
         self.game_owners = data["game_owners_scaled"]
+        self.user_rating_count = data["user_rating_count_scaled"]
+        self.user_rating_std   = data["user_rating_std_scaled"]
         self.category_indices = data["category_indices"]
         self.mechanic_indices = data["mechanic_indices"]
 
@@ -217,6 +224,8 @@ class UserGameDataSet(Dataset):
             "bayes_average": torch.tensor(self.bayes_average.iloc[idx], dtype=torch.float32),
             "age":           torch.tensor(self.age.iloc[idx],           dtype=torch.float32),  # scaled float
             "game_owners":   torch.tensor(self.game_owners.iloc[idx],   dtype=torch.float32),  # scaled float
+            "user_rating_count": torch.tensor(self.user_rating_count.iloc[idx], dtype=torch.float32),
+            "user_rating_std":   torch.tensor(self.user_rating_std.iloc[idx],   dtype=torch.float32),
             "category_indices": torch.tensor(self.category_indices.iloc[idx], dtype=torch.long),
             "mechanic_indices": torch.tensor(self.mechanic_indices.iloc[idx], dtype=torch.long),
         }
@@ -239,6 +248,8 @@ def collate_fn(batch):
         "bayes_average":   torch.stack([b["bayes_average"]   for b in batch]),
         "age":             torch.stack([b["age"]             for b in batch]),
         "game_owners":     torch.stack([b["game_owners"]     for b in batch]),
+        "user_rating_count": torch.stack([b["user_rating_count"] for b in batch]),
+        "user_rating_std":   torch.stack([b["user_rating_std"]   for b in batch]),
         "category_indices": category_indices,
         "category_offsets": category_offsets,
         "mechanic_indices": mechanic_indices,
@@ -533,21 +544,48 @@ def create_train_data(
     train_data, test_data       = model_selection.train_test_split(game_data_model, test_size=0.2,  random_state=42)
     train_data, validation_data = model_selection.train_test_split(train_data,      test_size=0.2,  random_state=42)
 
-    # Compute user mean ratings from training data only — using val/test would
-    # leak future information into the normalization.
+    # Compute user-level statistics from TRAINING data only — using val/test
+    # would leak future information.  Computed on RAW ratings, before the
+    # residual subtraction below.
     user_means  = train_data.groupby('user_id')['user_rating'].mean()
     global_mean = float(user_means.mean())
 
-    # Subtract each user's mean so the model learns relative preferences.
-    # Users present in val/test but not in train fall back to the global mean.
+    user_stats = train_data.groupby('user_id')['user_rating'].agg(
+        rating_count='count',
+        rating_std='std',
+    )
+    # Rating counts follow a power law — log-compress before scaling.
+    user_stats['rating_count'] = np.log1p(user_stats['rating_count'])
+    # Single-rating users have undefined std — fall back to the population mean.
+    global_std = float(user_stats['rating_std'].mean())
+    user_stats['rating_std'] = user_stats['rating_std'].fillna(global_std)
+
+    count_scaler = StandardScaler().fit(user_stats[['rating_count']])
+    std_scaler   = StandardScaler().fit(user_stats[['rating_std']])
+    user_stats['user_rating_count_scaled'] = count_scaler.transform(user_stats[['rating_count']]).ravel()
+    user_stats['user_rating_std_scaled']   = std_scaler.transform(user_stats[['rating_std']]).ravel()
+
+    # Subtract each user's mean (residual target) and attach the scaled user-stat
+    # features.  Users absent from train fall back to the global mean / a neutral
+    # 0.0 (the scaled population mean).
     for df in (train_data, validation_data, test_data):
         df['user_rating'] = (
             df['user_rating'] - df['user_id'].map(user_means).fillna(global_mean)
+        )
+        df['user_rating_count_scaled'] = (
+            df['user_id'].map(user_stats['user_rating_count_scaled']).fillna(0.0)
+        )
+        df['user_rating_std_scaled'] = (
+            df['user_id'].map(user_stats['user_rating_std_scaled']).fillna(0.0)
         )
 
     user_means_df = (
         user_means.reset_index()
                   .rename(columns={'user_rating': 'mean_rating'})
+                  .merge(
+                      user_stats[['user_rating_count_scaled', 'user_rating_std_scaled']].reset_index(),
+                      on='user_id', how='left',
+                  )
     )
     user_means_df['global_mean'] = global_mean
     user_means_df.to_csv(config["data_model"]["user_means_path"], index=False)
@@ -667,6 +705,8 @@ def _run_epoch(
                     bayes_average    = batch["bayes_average"],
                     age              = batch["age"],
                     game_owners      = batch["game_owners"],
+                    user_rating_count= batch["user_rating_count"],
+                    user_rating_std  = batch["user_rating_std"],
                     category_indices = batch["category_indices"],
                     category_offsets = batch["category_offsets"],
                     mechanic_indices = batch["mechanic_indices"],
@@ -730,7 +770,7 @@ def train_model(
         T_max   = start_epoch + epochs,  # total epochs so resumed runs continue the cosine cycle
         eta_min = 1e-5,
     )
-    criterion         = nn.HuberLoss(delta=0.5)
+    criterion         = nn.HuberLoss(delta=1.0)
     scaler            = GradScaler(enabled=(DEVICE.type == "cuda"))
     r2_metric         = torchmetrics.R2Score().to(DEVICE)
 

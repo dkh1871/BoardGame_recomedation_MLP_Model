@@ -72,6 +72,8 @@ def recommend(
     model: torch.nn.Module,
     user_means: dict,
     global_mean: float,
+    count_means: dict,
+    std_means: dict,
     top_k: int = 10,
     exclude_rated: bool = True,
     batch_size: int = 1000,
@@ -88,6 +90,8 @@ def recommend(
     model         : Trained BoardGameRecommender model.
     user_means    : Dict mapping encoded user_id to that user's mean training rating.
     global_mean   : Fallback mean used for users not in user_means.
+    count_means   : Dict mapping encoded user_id to that user's scaled log rating-count.
+    std_means     : Dict mapping encoded user_id to that user's scaled rating std.
     top_k         : Number of recommendations to return.
     exclude_rated : If True, games the user has already rated are excluded.
     batch_size    : Inference batch size.
@@ -117,6 +121,10 @@ def recommend(
     # Columns required by UserGameDataSet
     infer_df["user_id"]     = user_id_enc
     infer_df["user_rating"] = 0.0  # placeholder — not used in the forward pass
+    # Scaled user-stat features are constant per user; fall back to 0.0 (the
+    # scaled population mean) for users absent from the training stats.
+    infer_df["user_rating_count_scaled"] = count_means.get(user_id_enc, 0.0)
+    infer_df["user_rating_std_scaled"]   = std_means.get(user_id_enc, 0.0)
 
     # Optionally drop games the user has already rated
     if exclude_rated:
@@ -148,6 +156,8 @@ def recommend(
                 bayes_average    = batch["bayes_average"],
                 age              = batch["age"],
                 game_owners      = batch["game_owners"],
+                user_rating_count= batch["user_rating_count"],
+                user_rating_std  = batch["user_rating_std"],
                 category_indices = batch["category_indices"],
                 category_offsets = batch["category_offsets"],
                 mechanic_indices = batch["mechanic_indices"],
@@ -283,6 +293,8 @@ def main():
         user_means_df  = pd.read_csv(config["data_model"]["user_means_path"])
         global_mean    = float(user_means_df["global_mean"].iloc[0])
         user_means_map = dict(zip(user_means_df["user_id"], user_means_df["mean_rating"]))
+        count_means_map = dict(zip(user_means_df["user_id"], user_means_df["user_rating_count_scaled"]))
+        std_means_map   = dict(zip(user_means_df["user_id"], user_means_df["user_rating_std_scaled"]))
     except FileNotFoundError as e:
         sys.exit(f"ERROR: {e}\nRun board_game_rec.py first to generate the required files.")
 
@@ -324,6 +336,8 @@ def main():
             model         = model,
             user_means    = user_means_map,
             global_mean   = global_mean,
+            count_means   = count_means_map,
+            std_means     = std_means_map,
             top_k         = args.top_k,
             exclude_rated = not args.include_rated,
         )
